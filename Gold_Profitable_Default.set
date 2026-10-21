@@ -1,10 +1,16 @@
-; SMC Liquidity EA - Gold Strategy Tester Optimized Preset (Strict 5M Structure & Daily Sweep)
+; SMC Liquidity EA - Gold Strategy Tester Optimized Preset (Strict Major Trend Filter H4+H1 & 15M/5M Setup)
 MagicNumber=202409
 EAComment=SMC_LIQ
+EnableMajorTrendFilter=true
+Trend_Timeframe_HTF=240
+Trend_Timeframe_LTF=60
+TrendSwingStrength=2
+TrendBarsLookback=80
+CloseOnTrendChange=false
 Setup_Timeframe=15
 Structure_Timeframe=5
 Entry_Timeframe=5
-LiquiditySource=0
+LiquiditySource=2
 StrictDailySweep=true
 ShowPDH_PDL_Lines=true
 ClrPDH=16748572

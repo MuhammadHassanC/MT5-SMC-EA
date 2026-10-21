@@ -250,6 +250,11 @@ struct SSymbolState
    bool              beActivated;      // Has structural break-even been activated (at >= $0.50 profit)
    double            beHighestProfit;  // Highest floating profit recorded for active trade
 
+   // Major Trend Filter (H4 + H1 Structure)
+   ENUM_DIRECTION    h4Trend;
+   ENUM_DIRECTION    h1Trend;
+   ENUM_DIRECTION    majorTrend;
+
    // Daily statistics
    double            dailyPnL;
    int               dailyTradeCount;
@@ -275,6 +280,14 @@ input group "══════ General ══════"
 input long            MagicNumber              = 202409;        // Magic Number
 input string          EAComment                = "SMC_LIQ";     // Order Comment
 
+input group "══════ Major Trend Filter (H4 + H1 Structure) ══════"
+input bool            EnableMajorTrendFilter   = true;          // Enable Major Trend Filter (H4 + H1 Alignment)
+input ENUM_TIMEFRAMES Trend_Timeframe_HTF      = PERIOD_H4;     // Major Trend Timeframe 1 (H4)
+input ENUM_TIMEFRAMES Trend_Timeframe_LTF      = PERIOD_H1;     // Major Trend Timeframe 2 (H1)
+input int             TrendSwingStrength       = 2;             // Trend Swing Strength (bars each side)
+input int             TrendBarsLookback        = 80;            // Trend Bars Lookback (completed bars)
+input bool            CloseOnTrendChange       = false;         // Close Open Trade on Major Trend Reversal (false=preserve SL/TP)
+
 input group "══════ Timeframes (Client Sequence) ══════"
 input ENUM_TIMEFRAMES Setup_Timeframe          = PERIOD_M15;    // Setup Timeframe (15M Liquidity Sweep)
 input ENUM_TIMEFRAMES Structure_Timeframe      = PERIOD_M5;     // Structure Timeframe (5M CHOCH, Displacement, OB, FVG)
@@ -283,12 +296,12 @@ input ENUM_TIMEFRAMES Entry_Timeframe          = PERIOD_M5;     // Entry Confirm
 #define HTF_Timeframe Setup_Timeframe
 #define LTF_Timeframe Entry_Timeframe
 
-input group "══════ Liquidity Source (PDH / PDL) ══════"
-input ENUM_LIQUIDITY_SOURCE LiquiditySource    = LIQ_PREVIOUS_DAY_HL; // Liquidity Source (PDH/PDL or Swings)
-input bool            StrictDailySweep         = true;                // Strictly Within Current Daily Candle Sweep
-input bool            ShowPDH_PDL_Lines        = true;                // Draw Previous Day High/Low Lines
-input color           ClrPDH                   = clrDodgerBlue;       // PDH (Buy-Side Liquidity) Color
-input color           ClrPDL                   = clrOrangeRed;        // PDL (Sell-Side Liquidity) Color
+input group "══════ Liquidity Source (External PDH/PDL & Internal Swings) ══════"
+input ENUM_LIQUIDITY_SOURCE LiquiditySource    = LIQ_BOTH;      // Liquidity Source (Both External & Internal)
+input bool            StrictDailySweep         = true;          // Strictly Within Current Daily Candle Sweep
+input bool            ShowPDH_PDL_Lines        = true;          // Draw Previous Day High/Low Lines
+input color           ClrPDH                   = clrDodgerBlue; // PDH (Buy-Side Liquidity) Color
+input color           ClrPDL                   = clrOrangeRed;  // PDL (Sell-Side Liquidity) Color
 
 input group "══════ Lower-Timeframe Entry (1M/3M/5M) ══════"
 input ENUM_LTF_CONFIRMATION LTFConfirmationMethod = CONFIRM_LTF_ANY;  // LTF Confirmation (Rejection/CHoCH/Any)
@@ -651,6 +664,142 @@ int DetectSwings(MqlRates &rates[], int rateCount, int swingStr,
 }
 
 //╔═══════════════════════════════════════════════════════════════════╗
+//║       MAJOR TREND DETECTION — H4 & H1 MARKET STRUCTURE           ║
+//╚═══════════════════════════════════════════════════════════════════╝
+
+// Determine market structure (HH/HL or LH/LL) on completed candles of a given timeframe.
+// Bullish: Higher Highs & Higher Lows (HH/HL)
+// Bearish: Lower Highs & Lower Lows (LH/LL)
+// Unclear / Conflict: DIR_NONE
+ENUM_DIRECTION DetermineTimeframeStructure(string sym, ENUM_TIMEFRAMES tf, int lookback, int swingStrength, double pointVal)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   // Copy completed candles only (starting from bar 1)
+   int copied = CopyRates(sym, tf, 1, lookback, rates);
+   if(copied < (swingStrength * 2 + 5))
+      return DIR_NONE;
+
+   SSwingPoint highs[MAX_SWINGS];
+   SSwingPoint lows[MAX_SWINGS];
+   int highCount = 0;
+   int lowCount  = 0;
+
+   // Detect confirmed swings on completed bars
+   for(int c = swingStrength; c < copied - swingStrength && (highCount < MAX_SWINGS && lowCount < MAX_SWINGS); c++)
+   {
+      bool isHigh = true;
+      bool isLow  = true;
+
+      for(int s = 1; s <= swingStrength; s++)
+      {
+         if(rates[c - s].high >= rates[c].high) isHigh = false;
+         if(rates[c - s].low  <= rates[c].low)  isLow  = false;
+         if(rates[c + s].high >= rates[c].high) isHigh = false;
+         if(rates[c + s].low  <= rates[c].low)  isLow  = false;
+         if(!isHigh && !isLow) break;
+      }
+
+      if(isHigh && highCount < MAX_SWINGS)
+      {
+         highs[highCount].price    = rates[c].high;
+         highs[highCount].time     = rates[c].time;
+         highs[highCount].barIndex = c + 1;
+         highs[highCount].isHigh   = true;
+         highCount++;
+      }
+      if(isLow && lowCount < MAX_SWINGS)
+      {
+         lows[lowCount].price    = rates[c].low;
+         lows[lowCount].time     = rates[c].time;
+         lows[lowCount].barIndex = c + 1;
+         lows[lowCount].isHigh   = false;
+         lowCount++;
+      }
+   }
+
+   if(highCount < 2 || lowCount < 2)
+   {
+      // Fallback if market had a strong run with single swing
+      if(highCount >= 1 && lowCount >= 1)
+      {
+         double lastClose = rates[0].close;
+         if(lastClose > highs[0].price) return DIR_BULLISH;
+         if(lastClose < lows[0].price)  return DIR_BEARISH;
+      }
+      return DIR_NONE;
+   }
+
+   // highs[0] is most recent confirmed swing high, highs[1] is prior swing high
+   // lows[0] is most recent confirmed swing low, lows[1] is prior swing low
+   double h0 = highs[0].price;
+   double h1 = highs[1].price;
+   double l0 = lows[0].price;
+   double l1 = lows[1].price;
+   double lastClose = rates[0].close;
+   double buf = 2 * pointVal;
+
+   // 1. Classic Bullish Structure: Higher High (HH) AND Higher Low (HL)
+   bool isBullish = false;
+   if(h0 > h1 + buf && l0 > l1 + buf)
+      isBullish = true;
+   // Or recent candle closed above the most recent swing high (MSS/BOS continuation) with a higher low
+   else if(lastClose > h0 + buf && l0 >= l1 - buf)
+      isBullish = true;
+   // Or HH formed and price maintains above the recent HL
+   else if(h0 > h1 + buf && lastClose > l0 + buf)
+      isBullish = true;
+
+   // 2. Classic Bearish Structure: Lower High (LH) AND Lower Low (LL)
+   bool isBearish = false;
+   if(h0 < h1 - buf && l0 < l1 - buf)
+      isBearish = true;
+   // Or recent candle closed below the most recent swing low (MSS/BOS continuation) with a lower high
+   else if(lastClose < l0 - buf && h0 <= h1 + buf)
+      isBearish = true;
+   // Or LH formed and price maintains below the recent LH
+   else if(h0 < h1 - buf && lastClose < h0 - buf)
+      isBearish = true;
+
+   if(isBullish && !isBearish)
+      return DIR_BULLISH;
+   if(isBearish && !isBullish)
+      return DIR_BEARISH;
+
+   return DIR_NONE;
+}
+
+// Update Major Trend by confirming alignment between H4 and H1
+void UpdateMajorTrend(SSymbolState &st, double pointVal)
+{
+   if(!EnableMajorTrendFilter)
+   {
+      st.h4Trend    = DIR_NONE;
+      st.h1Trend    = DIR_NONE;
+      st.majorTrend = DIR_NONE;
+      return;
+   }
+
+   st.h4Trend = DetermineTimeframeStructure(st.symbol, Trend_Timeframe_HTF, TrendBarsLookback, TrendSwingStrength, pointVal);
+   st.h1Trend = DetermineTimeframeStructure(st.symbol, Trend_Timeframe_LTF, TrendBarsLookback, TrendSwingStrength, pointVal);
+
+   // Strict Alignment: BOTH timeframes must confirm the same direction
+   if(st.h4Trend == DIR_BULLISH && st.h1Trend == DIR_BULLISH)
+   {
+      st.majorTrend = DIR_BULLISH;
+   }
+   else if(st.h4Trend == DIR_BEARISH && st.h1Trend == DIR_BEARISH)
+   {
+      st.majorTrend = DIR_BEARISH;
+   }
+   else
+   {
+      // Conflict or unclear direction -> No trade allowed
+      st.majorTrend = DIR_NONE;
+   }
+}
+
+//╔═══════════════════════════════════════════════════════════════════╗
 //║          LIQUIDITY LEVEL DETECTION & SWEEP                       ║
 //╚═══════════════════════════════════════════════════════════════════╝
 
@@ -755,9 +904,10 @@ void BuildLiquidityLevels(SSymbolState &st, double pointVal)
 }
 
 // Check if any liquidity level has been swept.
-// Rules 1, 2, 3: 15M sweep of Previous Day High / Low with rejection.
-// Returns true if a sweep + rejection is detected and populates setup details.
-// IMPORTANT: The sweep itself does NOT trigger an entry!
+// Filtered by H4 + H1 Major Trend:
+// - Bullish Trend: BUY ONLY (low-side sweeps: PDL or swing lows)
+// - Bearish Trend: SELL ONLY (high-side sweeps: PDH or swing highs)
+// - Unclear / Conflicting: Block all setups
 bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, double pointVal)
 {
    double sweepBuf = SweepBufferPoints * pointVal;
@@ -767,11 +917,27 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
    if(currentDayStart == 0)
       currentDayStart = st.d1LastBarTime + PeriodSeconds(PERIOD_D1);
 
+   // Major Trend Direction Filter
+   bool allowSellSetup = true; // Sell setup = High-side sweep (PDH or swing high)
+   bool allowBuySetup  = true; // Buy setup  = Low-side sweep (PDL or swing low)
+
+   if(EnableMajorTrendFilter)
+   {
+      // If trend is unclear or H4/H1 conflict, do not allow any new setup
+      if(st.majorTrend == DIR_NONE)
+         return false;
+
+      // In Bullish Trend: ONLY allow low-side sweeps (BUY ONLY)
+      allowBuySetup  = (st.majorTrend == DIR_BULLISH);
+      // In Bearish Trend: ONLY allow high-side sweeps (SELL ONLY)
+      allowSellSetup = (st.majorTrend == DIR_BEARISH);
+   }
+
    // 1. Check Previous Day High & Low (External Liquidity - Primary Client Method)
    if(LiquiditySource == LIQ_PREVIOUS_DAY_HL || LiquiditySource == LIQ_BOTH)
    {
       // Check Buy-Side Liquidity Sweep (PDH) -> SELL SETUP
-      if(st.pdhPrice > 0)
+      if(allowSellSetup && st.pdhPrice > 0)
       {
          double level = st.pdhPrice;
          for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
@@ -810,7 +976,7 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
                st.pdhConsumed    = false; // Reset on valid new sweep
                st.setupStartTime = TimeCurrent();
 
-               LogInfo(StringFormat("%s [15M PDH SWEEP (TODAY)] Buy-side swept at %.5f (high=%.5f, bar=%d, time=%s) -> SELL SETUP (Waiting for 5M Displacement & POI)",
+               LogInfo(StringFormat("%s [EXTERNAL PDH SWEEP (HIGH-SIDE)] Swept at %.5f (high=%.5f, bar=%d, time=%s) -> SELL SETUP (Trend=BEARISH)",
                                     st.symbol, level, htfRates[b].high, b, TimeToString(htfRates[b].time, TIME_MINUTES)));
                return true;
             }
@@ -818,7 +984,7 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
       }
 
       // Check Sell-Side Liquidity Sweep (PDL) -> BUY SETUP
-      if(st.pdlPrice > 0)
+      if(allowBuySetup && st.pdlPrice > 0)
       {
          double level = st.pdlPrice;
          for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
@@ -857,85 +1023,99 @@ bool CheckLiquiditySweep(SSymbolState &st, MqlRates &htfRates[], int htfCount, d
                st.pdlConsumed    = false; // Reset on valid new sweep
                st.setupStartTime = TimeCurrent();
 
-               LogInfo(StringFormat("%s [15M PDL SWEEP + REJECTION] Sell-side swept at %.5f (low=%.5f, bar=%d) -> BUY SETUP (Waiting for 15M Displacement)",
-                                    st.symbol, level, htfRates[b].low, b));
+               LogInfo(StringFormat("%s [EXTERNAL PDL SWEEP (LOW-SIDE)] Swept at %.5f (low=%.5f, bar=%d, time=%s) -> BUY SETUP (Trend=BULLISH)",
+                                    st.symbol, level, htfRates[b].low, b, TimeToString(htfRates[b].time, TIME_MINUTES)));
                return true;
             }
          }
       }
    }
 
-   // 2. Check Swing Highs / Lows if configured
+   // 2. Check Swing Highs / Lows (Internal / Range Liquidity)
    if(LiquiditySource == LIQ_SWING_HIGHS_LOWS || (LiquiditySource == LIQ_BOTH && st.bias == DIR_NONE))
    {
-      // Check buy-side sweeps (→ bearish bias)
-      for(int l = 0; l < st.buySideLiqCount; l++)
+      // Check buy-side sweeps (high-side sweeps → bearish bias)
+      if(allowSellSetup)
       {
-         if(st.buySideLiq[l].swept) continue;
-         double level = st.buySideLiq[l].price;
-
-         for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
+         for(int l = 0; l < st.buySideLiqCount; l++)
          {
-            if(StrictDailySweep && htfRates[b].time < currentDayStart) break;
-            if(BlockReEntryAfterSL && st.lastFailedSweepTime == htfRates[b].time) continue;
-            double penetration = htfRates[b].high - level;
-            if(penetration < sweepBuf) continue;
+            if(st.buySideLiq[l].swept) continue;
+            double level = st.buySideLiq[l].price;
+            bool isInternal = (st.pdhPrice <= 0 || level <= st.pdhPrice + sweepBuf);
 
-            bool swept = (htfRates[b].high > level + sweepBuf) && (htfRates[b].close <= level);
-            if(swept)
+            for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
             {
-               st.buySideLiq[l].swept     = true;
-               st.buySideLiq[l].sweepTime = htfRates[b].time;
-               st.buySideLiq[l].sweepPrice= htfRates[b].high;
+               if(StrictDailySweep && htfRates[b].time < currentDayStart) break;
+               if(BlockReEntryAfterSL && st.lastFailedSweepTime == htfRates[b].time) continue;
+               if(st.lastFailedSweepPrice > 0 && htfRates[b].high <= st.lastFailedSweepPrice + minSweep) continue;
 
-               st.bias            = DIR_BEARISH;
-               st.liquidityLevel  = level;
-               st.sweepPrice      = htfRates[b].high;
-               st.sweepTime       = htfRates[b].time;
-               st.sweepBar        = b;
-               st.isPDHSweep      = false;
-               st.isPDLSweep      = false;
-               st.setupStartTime  = TimeCurrent();
+               double penetration = htfRates[b].high - level;
+               if(penetration < sweepBuf) continue;
 
-               LogInfo(StringFormat("%s Buy-side swing swept at %.5f (high=%.5f)",
-                                   st.symbol, level, htfRates[b].high));
-               return true;
+               bool swept = (htfRates[b].high > level + sweepBuf) && (htfRates[b].close <= level);
+               if(swept)
+               {
+                  st.buySideLiq[l].swept      = true;
+                  st.buySideLiq[l].sweepTime  = htfRates[b].time;
+                  st.buySideLiq[l].sweepPrice = htfRates[b].high;
+
+                  st.bias            = DIR_BEARISH;
+                  st.liquidityLevel  = level;
+                  st.sweepPrice      = htfRates[b].high;
+                  st.sweepTime       = htfRates[b].time;
+                  st.sweepBar        = b;
+                  st.isPDHSweep      = false;
+                  st.isPDLSweep      = false;
+                  st.setupStartTime  = TimeCurrent();
+
+                  string liqType = isInternal ? "INTERNAL" : "EXTERNAL";
+                  LogInfo(StringFormat("%s [%s BUY-SIDE SWEEP (HIGH-SIDE)] Swept at %.5f (high=%.5f) -> SELL SETUP (Trend=BEARISH)",
+                                       st.symbol, liqType, level, htfRates[b].high));
+                  return true;
+               }
             }
          }
       }
 
-      // Check sell-side sweeps (→ bullish bias)
-      for(int l = 0; l < st.sellSideLiqCount; l++)
+      // Check sell-side sweeps (low-side sweeps → bullish bias)
+      if(allowBuySetup)
       {
-         if(st.sellSideLiq[l].swept) continue;
-         double level = st.sellSideLiq[l].price;
-
-         for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
+         for(int l = 0; l < st.sellSideLiqCount; l++)
          {
-            if(StrictDailySweep && htfRates[b].time < currentDayStart) break;
-            if(BlockReEntryAfterSL && st.lastFailedSweepTime == htfRates[b].time) continue;
-            double penetration = level - htfRates[b].low;
-            if(penetration < sweepBuf) continue;
+            if(st.sellSideLiq[l].swept) continue;
+            double level = st.sellSideLiq[l].price;
+            bool isInternal = (st.pdlPrice <= 0 || level >= st.pdlPrice - sweepBuf);
 
-            bool swept = (htfRates[b].low < level - sweepBuf) && (htfRates[b].close >= level);
-            if(swept)
+            for(int b = 1; b <= SweepLookbackBars && b < htfCount; b++)
             {
-               st.sellSideLiq[l].swept     = true;
-               st.sellSideLiq[l].sweepTime = htfRates[b].time;
-               st.sellSideLiq[l].sweepPrice= htfRates[b].low;
+               if(StrictDailySweep && htfRates[b].time < currentDayStart) break;
+               if(BlockReEntryAfterSL && st.lastFailedSweepTime == htfRates[b].time) continue;
+               if(st.lastFailedSweepPrice > 0 && htfRates[b].low >= st.lastFailedSweepPrice - minSweep) continue;
 
-               st.bias            = DIR_BULLISH;
-               st.liquidityLevel  = level;
-               st.sweepPrice      = htfRates[b].low;
-               st.sweepTime       = htfRates[b].time;
-               st.sweepBar        = b;
-               st.isPDHSweep      = false;
-               st.isPDLSweep      = false;
-               st.setupStartTime  = TimeCurrent();
+               double penetration = level - htfRates[b].low;
+               if(penetration < sweepBuf) continue;
 
-               LogInfo(StringFormat("%s Sell-side swing swept at %.5f (low=%.5f)",
-                                   st.symbol, level, htfRates[b].low));
-               return true;
+               bool swept = (htfRates[b].low < level - sweepBuf) && (htfRates[b].close >= level);
+               if(swept)
+               {
+                  st.sellSideLiq[l].swept      = true;
+                  st.sellSideLiq[l].sweepTime  = htfRates[b].time;
+                  st.sellSideLiq[l].sweepPrice = htfRates[b].low;
+
+                  st.bias            = DIR_BULLISH;
+                  st.liquidityLevel  = level;
+                  st.sweepPrice      = htfRates[b].low;
+                  st.sweepTime       = htfRates[b].time;
+                  st.sweepBar        = b;
+                  st.isPDHSweep      = false;
+                  st.isPDLSweep      = false;
+                  st.setupStartTime  = TimeCurrent();
+
+                  string liqType = isInternal ? "INTERNAL" : "EXTERNAL";
+                  LogInfo(StringFormat("%s [%s SELL-SIDE SWEEP (LOW-SIDE)] Swept at %.5f (low=%.5f) -> BUY SETUP (Trend=BULLISH)",
+                                       st.symbol, liqType, level, htfRates[b].low));
+                  return true;
+               }
             }
          }
       }
@@ -1867,6 +2047,22 @@ int CountPositions(string sym, long magic)
    return count;
 }
 
+// Close all positions for a given symbol and magic number
+void CloseAllPositions(string sym, long magic)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == magic &&
+         PositionGetString(POSITION_SYMBOL) == sym)
+      {
+         g_trade.PositionClose(ticket);
+      }
+   }
+}
+
 // Count all positions across all symbols for this EA
 int CountAllPositions()
 {
@@ -2369,6 +2565,13 @@ void BuildEntryPlan(SSymbolState &st, double pointVal)
 // Place pending orders for the setup
 bool PlacePendingOrders(SSymbolState &st, double pointVal)
 {
+   if(EnableMajorTrendFilter && (st.majorTrend != st.bias || st.majorTrend == DIR_NONE))
+   {
+      LogWarn(StringFormat("%s Pending orders blocked by Major Trend Filter (Trend=%s, Bias=%s)",
+                           st.symbol, DirectionToString(st.majorTrend), DirectionToString(st.bias)));
+      return false;
+   }
+
    g_trade.SetExpertMagicNumber(st.magicNumber);
    g_trade.SetDeviationInPoints(Slippage);
    g_trade.SetTypeFilling(GetFillType(st.symbol));
@@ -2474,6 +2677,13 @@ bool PlacePendingOrders(SSymbolState &st, double pointVal)
 // Execute a market entry with strictly valid SL/TP
 bool ExecuteMarketEntry(SSymbolState &st, double pointVal)
 {
+   if(EnableMajorTrendFilter && (st.majorTrend != st.bias || st.majorTrend == DIR_NONE))
+   {
+      LogWarn(StringFormat("%s Market entry blocked by Major Trend Filter (Trend=%s, Bias=%s)",
+                           st.symbol, DirectionToString(st.majorTrend), DirectionToString(st.bias)));
+      return false;
+   }
+
    g_trade.SetExpertMagicNumber(st.magicNumber);
    g_trade.SetDeviationInPoints(Slippage);
    g_trade.SetTypeFilling(GetFillType(st.symbol));
@@ -3166,6 +3376,22 @@ void UpdateDashboard(SSymbolState &st)
              biasClr);
    row++;
 
+   // Major Trend Filter (H4 + H1 Structure)
+   if(EnableMajorTrendFilter)
+   {
+      string h4Str = (st.h4Trend == DIR_BULLISH) ? "BULL" : (st.h4Trend == DIR_BEARISH ? "BEAR" : "FLAT");
+      string h1Str = (st.h1Trend == DIR_BULLISH) ? "BULL" : (st.h1Trend == DIR_BEARISH ? "BEAR" : "FLAT");
+      string majorStr = (st.majorTrend == DIR_BULLISH) ? "BUY ONLY" :
+                        (st.majorTrend == DIR_BEARISH ? "SELL ONLY" : "CONFLICT/BLOCKED");
+      color majorClr = (st.majorTrend == DIR_BULLISH) ? clrLime :
+                       (st.majorTrend == DIR_BEARISH ? clrOrangeRed : clrGold);
+
+      DashLabel(DASH_TAG+"TREND", x, y + lineH * row,
+                StringFormat("Trend: H4=%s H1=%s │ %s", h4Str, h1Str, majorStr),
+                majorClr);
+      row++;
+   }
+
    // External Liquidity (PDH / PDL - Rule 1)
    DashLabel(DASH_TAG+"PDH_PDL", x, y + lineH * row,
              StringFormat("PDH: %.2f  │  PDL: %.2f", st.pdhPrice, st.pdlPrice),
@@ -3322,6 +3548,9 @@ void ResetSetup(SSymbolState &st)
    st.targetLiqLevel   = 0;
    st.beActivated      = false;
    st.beHighestProfit  = 0;
+   st.h4Trend          = DIR_NONE;
+   st.h1Trend          = DIR_NONE;
+   st.majorTrend       = DIR_NONE;
    // NOTE: We deliberately do NOT reset pdhConsumed, pdlConsumed, lastFailedSweepTime, lastFailedSweepPrice!
    // Those persist across reset so that Rule 7 (No immediate re-entry after SL) is strictly enforced.
 }
@@ -3343,6 +3572,9 @@ void ProcessSymbol(int si)
    UpdatePreviousDayHL(g_states[si]);
    if(ShowPDH_PDL_Lines && sym == _Symbol)
       DrawPreviousDayHLLevels(g_states[si]);
+
+   // Major Trend Filter: Update H4 and H1 Market Structure
+   UpdateMajorTrend(g_states[si], point);
 
    // Check daily risk limit
    if(IsDailyLossExceeded(g_states[si]))
@@ -3459,6 +3691,16 @@ void ProcessSymbol(int si)
          //───────────────────────────────────────────────────
          case STATE_WAITING_FOR_CHOCH:
          {
+            // Major Trend Filter check: if H4/H1 trend shifted or conflicted while waiting for displacement
+            if(EnableMajorTrendFilter && g_states[si].majorTrend != g_states[si].bias)
+            {
+               LogInfo(StringFormat("%s Major trend shifted or conflicting during CHoCH wait (Trend=%s, Setup Bias=%s) — setup invalidated",
+                                    sym, DirectionToString(g_states[si].majorTrend), DirectionToString(g_states[si].bias)));
+               g_states[si].currentState = STATE_SETUP_INVALIDATED;
+               stateChanged = true;
+               break;
+            }
+
             int age = BarsElapsed(sym, Setup_Timeframe, g_states[si].setupStartTime);
             if(age > SetupExpirationBars)
             {
@@ -3516,6 +3758,16 @@ void ProcessSymbol(int si)
          //───────────────────────────────────────────────────
          case STATE_WAITING_FOR_RETEST:
          {
+            // Major Trend Filter check: if H4/H1 trend shifted or conflicted while waiting for POI retest
+            if(EnableMajorTrendFilter && g_states[si].majorTrend != g_states[si].bias)
+            {
+               LogInfo(StringFormat("%s Major trend shifted or conflicting during POI retest wait (Trend=%s, Setup Bias=%s) — setup invalidated",
+                                    sym, DirectionToString(g_states[si].majorTrend), DirectionToString(g_states[si].bias)));
+               g_states[si].currentState = STATE_SETUP_INVALIDATED;
+               stateChanged = true;
+               break;
+            }
+
             int age = BarsElapsed(sym, Setup_Timeframe, g_states[si].displacementTime);
             if(age > MaxRetestWaitBars)
             {
@@ -3581,6 +3833,23 @@ void ProcessSymbol(int si)
 
             if(CheckLTFConfirmation(g_states[si], ltfRates, ltfCount, point))
             {
+               // Strict Major Trend Filter: verify immediately before any order execution
+               if(EnableMajorTrendFilter)
+               {
+                  UpdateMajorTrend(g_states[si], point);
+                  if(g_states[si].majorTrend != g_states[si].bias)
+                  {
+                     LogWarn(StringFormat("%s [MAJOR TREND FILTER BLOCKED ENTRY] Alignment lost before order execution: Trend=%s (H4=%s, H1=%s), Setup Bias=%s",
+                                          sym, DirectionToString(g_states[si].majorTrend),
+                                          DirectionToString(g_states[si].h4Trend),
+                                          DirectionToString(g_states[si].h1Trend),
+                                          DirectionToString(g_states[si].bias)));
+                     g_states[si].currentState = STATE_SETUP_INVALIDATED;
+                     stateChanged = true;
+                     break;
+                  }
+               }
+
                LogInfo(StringFormat("%s [LTF CONFIRMED ON %s] Executing entry (%s)",
                                     sym, EnumToString(Entry_Timeframe), EnumToString(EntryMode)));
                DrawEntryLevels(g_states[si]);
@@ -3689,6 +3958,20 @@ void ProcessSymbol(int si)
             if(CountPendingOrders(sym, g_states[si].magicNumber) > 0)
                DeletePendingOrders(g_states[si]);
 
+            // Trend reversal check: if CloseOnTrendChange is enabled, close active trades if H4/H1 reverses
+            if(EnableMajorTrendFilter && CloseOnTrendChange)
+            {
+               if(g_states[si].majorTrend != DIR_NONE && g_states[si].majorTrend != g_states[si].bias)
+               {
+                  LogWarn(StringFormat("%s [TREND REVERSAL DETECTED] Major trend shifted to %s while position is %s — closing active positions to protect capital",
+                                       sym, DirectionToString(g_states[si].majorTrend), DirectionToString(g_states[si].bias)));
+                  CloseAllPositions(sym, g_states[si].magicNumber);
+                  g_states[si].currentState = STATE_RESET;
+                  stateChanged = true;
+                  break;
+               }
+            }
+
             // Trade management
             ManageBreakEven(g_states[si]);
             ManagePartialClose(g_states[si]);
@@ -3793,6 +4076,11 @@ void ProcessSymbol(int si)
 int OnInit()
 {
    // Validate inputs
+   if(EnableMajorTrendFilter && Trend_Timeframe_HTF <= Trend_Timeframe_LTF)
+   {
+      LogError("Major Trend HTF timeframe must be greater than LTF timeframe (e.g. H4 > H1)");
+      return INIT_PARAMETERS_INCORRECT;
+   }
    if(HTF_Timeframe <= LTF_Timeframe)
    {
       LogError("HTF must be greater than LTF timeframe");
